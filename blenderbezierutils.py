@@ -15,7 +15,7 @@ FloatProperty, StringProperty, CollectionProperty, FloatVectorProperty, PointerP
 from bpy.types import Panel, Operator, WorkSpaceTool, AddonPreferences, Menu
 from mathutils import Vector, Matrix, geometry, kdtree
 from math import e, pi, log, sin, cos, tan, radians, degrees, sqrt, asin, acos, atan, floor, \
-ceil, pow, exp
+ceil, pow, exp, isclose
 from bpy_extras.view3d_utils import region_2d_to_vector_3d, region_2d_to_location_3d, \
 region_2d_to_origin_3d
 from bpy_extras.view3d_utils import location_3d_to_region_2d
@@ -2209,7 +2209,21 @@ class IntersectCurvesOp(Operator):
 
         return {'FINISHED'}
 
+from collections import namedtuple
+CurveMeshPair = namedtuple("CurveMeshPair", "curve mesh")
+
+def distance(v1, v2):
+    x = v1.co.x - v2.co.x
+    y = v1.co.y - v2.co.y
+    z = v1.co.z - v2.co.z
+    return sqrt(x*x + y*y + z*z)
+
 class IntersectCurvesMeshCleanerOp(Operator):
+    """
+    Currently makes assumptions about the cw/ccw-ness of the cross section in the mesh
+    As well as that the indexes of the vertices in the cross section are the same for all meshes
+    and match the original cross
+    """
     bl_idname = "object.intersect_curves_mesh_cleaner"
     bl_label = "Intersect Curves Mesh Cleaner"
     bl_options = {'REGISTER', 'UNDO'}
@@ -2218,14 +2232,114 @@ class IntersectCurvesMeshCleanerOp(Operator):
 
     def get_cross_section_horizontal_size(self, point_list):
         min_val =  sys.float_info.max
+        min_point_index = -1
         max_val = sys.float_info.min
-        for point in point_list:
+        max_point_index = -1
+        for i, point in enumerate(point_list):
             val = point.co.__getattribute__(self.bl_cross_section_axis);
             if val > max_val:
                 max_val = val
+                max_point_index = i
             elif val < min_val:
                 min_val = val
-        return max_val - min_val
+                min_point_index = i
+        return max_val - min_val, min_point_index, max_point_index
+
+    def traverse_mesh(self, mesh, cross_section_point_count, cross_section_horizontal_size, min_point_index, max_point_index):
+        blender_mesh = bmesh.new()
+        blender_mesh.from_mesh(mesh.mesh)
+        blender_mesh.faces.ensure_lookup_table()
+        
+        for face in blender_mesh.faces:
+            # if the mesh was generated from curve + cross section, then
+            # the first face should be the end cap cross section face
+            # so this should immediately break
+            if len(face.loops) == cross_section_point_count:
+                break
+
+        # TODO: match the face with the cross section properties
+        min_x = sys.float_info.max
+        min_y = sys.float_info.max
+        max_x = sys.float_info.min
+        max_y = sys.float_info.min
+
+        min_x_index = -1
+        min_y_index = -1
+        
+        max_x_index = -1
+        max_y_index = -1
+
+        for i, vert in enumerate(face.verts):
+            if vert.co.x > max_x:
+                max_x = vert.co.x
+                max_x_index = i
+            elif vert.co.x < min_x:
+                min_x = vert.co.x
+                min_x_index = i
+
+            if vert.co.y > max_y:
+                max_y = vert.co.y
+                max_y_index = i
+            elif vert.co.y < min_y:
+                min_y = vert.co.y
+                min_y_index = i
+
+        use_y = max_y - min_y > max_x - min_x
+        if use_y:
+            # pseudocode
+            horizontal_face_dist = distance(face.verts[max_y_index], face.verts[min_y_index])
+            horizontal_span_index_1 = max_y_index
+            horizontal_span_index_2 = min_y_index
+        else:
+            horizontal_face_dist = distance(face.verts[max_x_index], face.verts[min_x_index])
+            horizontal_span_index_1 = max_x_index
+            horizontal_span_index_2 = min_x_index
+
+
+        if not isclose(horizontal_face_dist, cross_section_horizontal_size, rel_tol=0.0001):
+            self.report({'WARNING'}, "Could not align cross section to face in curve")            
+            return False
+
+        # assumption of clockwise loop on face, and cross section:
+        index_span = max_point_index - min_point_index
+        if horizontal_span_index_2 > horizontal_span_index_1:
+            if not horizontal_span_index_2 - horizontal_span_index_1 == index_span:
+                self.report({'WARNING'}, "Could not align cross section indices to face in curve")
+                return False
+        else:
+            if not horizontal_span_index_1 - horizontal_span_index_2 == index_span:
+                self.report({'WARNING'}, "Could not align cross section indices to face in curve")
+                return False
+
+        # pick any of the edges of the face to start
+        x_section_edge_loop = face.loops[0]
+        x_section_edge_connected_face_loop = x_section_edge_loop.link_loop_radial_next
+
+        # proceed to first edge loop
+        edge_loop_towards_ring = x_section_edge_connected_face_loop.link_loop_next
+        edge_loop_in_ring = edge_loop_towards_ring.link_loop_next
+
+        edge_ring_index = 0;
+        while len(edge_loop_in_ring.face.loops) != cross_section_point_count:
+            starting_loop_index = edge_loop_in_ring.index
+            first_execution = True
+            while edge_loop_in_ring.index != starting_loop_index or first_execution:
+                if first_execution:
+                    first_execution = False
+
+                print("select", edge_loop_in_ring);
+                # progress to next edge in the edge loop
+                edge_loop_in_ring = edge_loop_in_ring.link_loop_next.link_loop_radial_next.link_loop_next
+            print("completed edge ring", edge_ring_index)
+            edge_ring_index += 1
+
+            edge_loop_in_ring = edge_loop_in_ring.link_loop_radial_next.link_loop_next.link_loop_next
+
+        # TODO: get line segments and find intersections among them using bezier intersection as limit
+
+        import pdb; pdb.set_trace()
+        return true
+
 
     def execute(self, context):
         params = bpy.context.window_manager.bezierToolkitParams
@@ -2238,7 +2352,6 @@ class IntersectCurvesMeshCleanerOp(Operator):
                 return {'FINISHED'}
 
         selected_objects = get_ordered_selection_objects()
-
         if len(selected_objects) % 2 == 0:
             self.report({'WARNING'}, "Even number of objects selected. Please select pairs of curves and meshes, and then the cross section used to create the meshes.")
             return {'FINISHED'}
@@ -2252,10 +2365,10 @@ class IntersectCurvesMeshCleanerOp(Operator):
             first_is_bezier = isBezier(first)
             second_is_bezier = isBezier(second)
             if first_is_bezier and not second_is_bezier:
-                curve_mesh_pairs.append((first, second))
+                curve_mesh_pairs.append(CurveMeshPair(first, second.to_mesh()))
                 curve_list.append(first)
             elif not first_is_bezier and second_is_bezier:
-                curve_mesh_pairs.append((second, first))
+                curve_mesh_pairs.append(CurveMeshPair(second, first.to_mesh()))
                 curve_list.append(second)
             else:
                 self.report({'WARNING'}, "Please select the meshes and curves in the order of their pairings.")
@@ -2265,6 +2378,7 @@ class IntersectCurvesMeshCleanerOp(Operator):
             self.report({'INFO'}, "Please select at least two Bezier curve objects")
             return {'FINISHED'}
     
+        # get intersections of bezier curves
         allIntersectCos, intersectMap = getCurveIntersectPts(curve_list, False, params.intersectMargin, rounding)
         if len(allIntersectCos) == 0:
             self.report({'INFO'}, "No intersections found")
@@ -2275,11 +2389,25 @@ class IntersectCurvesMeshCleanerOp(Operator):
         bm_points = bmesh.new()
         bm_points.from_mesh(mesh_points)
         points = bm_points.verts
-        if len(points) == 0:
+        cross_section_point_count = len(points)
+        if cross_section_point_count == 0:
             self.report({'WARNING'}, "Cross section has no vertices!")
             return {'FINISHED'}
+        elif cross_section_point_count == 4:
+            self.report({'WARNING'}, "Cross section must have more than 4 vertices!")
+            return {'FINISHED'}
 
-        cross_section_horizontal_size = self.get_cross_section_horizontal_size(points)
+        cross_section_horizontal_size, min_point_index, max_point_index = self.get_cross_section_horizontal_size(points)
+
+        splines_to_inspect = {}
+        for (curve_index, spline, _), _ in intersectMap.items():
+            if curve_index not in splines_to_inspect:
+                splines_to_inspect[curve_index] = []
+            splines_to_inspect[curve_index].append(spline)
+
+        for curve_index, splines in splines_to_inspect.items():
+            self.traverse_mesh(curve_mesh_pairs[curve_index], cross_section_point_count, cross_section_horizontal_size, min_point_index, max_point_index)
+        print(splines_to_inspect)
 
         return {'FINISHED'}
 
