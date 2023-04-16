@@ -2232,8 +2232,7 @@ class IntersectCurvesMeshCleanerOp(Operator):
     bl_cross_section_up_axis = "y"
     bl_mesh_up_axis = "z"
     absolute_float_tolerance = 0.0001
-    # TODO: the order of the x section differs from the x section in mesh
-    # devise a way of matching the vertices using the angles of the vertices, perhaps
+
     def get_cross_section_horizontal_size(self, point_list):
         min_val =  sys.float_info.max
         min_point_index = -1
@@ -2285,13 +2284,15 @@ class IntersectCurvesMeshCleanerOp(Operator):
         double_list = first_face_heights + first_face_heights
         cross_section_heights = [xpoint.co.__getattribute__(self.bl_cross_section_up_axis) for xpoint in cross_section_points_list]
 
+        # Assuming the cross section is symmetrical, the direction in which the
+        # vertices are listed doesn't matter because the heights should match
         offset_from_cross_section_indices = self.find_sequence_index(double_list, cross_section_heights)
         if offset_from_cross_section_indices is None:
             self.report({'WARNING'}, "Could not match the cross section with the meshes selected.")
             return False
 
-        loop_extreme_1_index = min_point_index + offset_from_cross_section_indices
-        loop_extreme_2_index = max_point_index + offset_from_cross_section_indices
+        loop_extreme_1_index = (min_point_index + offset_from_cross_section_indices) % cross_section_point_count 
+        loop_extreme_2_index = (max_point_index + offset_from_cross_section_indices) % cross_section_point_count
 
         # pick any of the edges of the face to start
         x_section_edge_loop = face.loops[0]
@@ -2304,6 +2305,10 @@ class IntersectCurvesMeshCleanerOp(Operator):
         edge_loop_index = 0
         edge_ring_index = 0
         point_pairs = []
+
+        axes = ["x", "y", "z"]
+        point_dims = [axis for axis in axes if axis != self.bl_mesh_up_axis]
+
         while len(edge_loop_in_ring.face.loops) != cross_section_point_count:
             starting_loop_index = edge_loop_in_ring.index
             first_execution = True
@@ -2324,12 +2329,16 @@ class IntersectCurvesMeshCleanerOp(Operator):
                 edge_loop_index = (edge_loop_index + 1) % cross_section_point_count
                 vert_index_in_ring += 1
 
-            print("completed edge ring", edge_ring_index)
             edge_ring_index += 1
-            point_pairs.append((current_extreme_1_vert, current_extreme_2_vert))
+            point_pairs.append(
+                ((current_extreme_1_vert.co.__getattribute__(point_dims[0]),
+                 current_extreme_1_vert.co.__getattribute__(point_dims[1])), 
+                (current_extreme_2_vert.co.__getattribute__(point_dims[0]),
+                 current_extreme_2_vert.co.__getattribute__(point_dims[1])))
+            )
             edge_loop_in_ring = edge_loop_in_ring.link_loop_radial_next.link_loop_next.link_loop_next
 
-        # TODO: get line segments and find intersections among them using bezier intersection as limit
+        # TODO: mchen get line segments and find intersections among them using bezier intersection as limit
 
         print(point_pairs)
         return True
