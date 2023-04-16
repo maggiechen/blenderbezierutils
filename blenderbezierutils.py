@@ -2212,6 +2212,8 @@ class IntersectCurvesOp(Operator):
 from collections import namedtuple
 CurveMeshPair = namedtuple("CurveMeshPair", "curve mesh")
 
+Point = namedtuple('Point', 'x y')
+
 def distance(v1, v2):
     x = v1.co.x - v2.co.x
     y = v1.co.y - v2.co.y
@@ -2222,7 +2224,9 @@ class IntersectCurvesMeshCleanerOp(Operator):
     """
     Currently makes assumptions about the cw/ccw-ness of the cross section in the mesh
     As well as that the indexes of the vertices in the cross section are the same for all meshes
-    and match the original cross section
+    and match the original cross section.
+
+    Assumes each curve object only has one spline
     """
     bl_idname = "object.intersect_curves_mesh_cleaner"
     bl_label = "Intersect Curves Mesh Cleaner"
@@ -2246,9 +2250,7 @@ class IntersectCurvesMeshCleanerOp(Operator):
             if val < min_val:
                 min_val = val
                 min_point_index = i
-        
-        import pdb; pdb.set_trace()
-        
+                
         return max_val - min_val, min_point_index, max_point_index
 
     def find_sequence_index(self, list_to_search, sequence_to_find):
@@ -2267,12 +2269,17 @@ class IntersectCurvesMeshCleanerOp(Operator):
             if found:
                 return current_index
 
-    def traverse_mesh(self, blender_mesh, cross_section_point_count, cross_section_horizontal_size, min_point_index, max_point_index, cross_section_points_list):
+    def traverse_mesh(self, blender_mesh, cross_section_point_count, cross_section_horizontal_size, min_point_index, max_point_index, cross_section_points_list, out_point_pairs):
         """
+        Find the pairs of vertices that are the extremes of the cross sections along the mesh
+
         min_point_index and max_point_index are the indices of the points in the cross section that
         produce the maximum horizontal size, cross_section_horizontal_size
+
+        out_point_pairs is the output list we will write to
         """
 
+        # Get the end cap face of the mesh
         for face in blender_mesh.faces:
             # if the mesh was generated from curve + cross section, then
             # the first face should be the end cap cross section face
@@ -2304,7 +2311,6 @@ class IntersectCurvesMeshCleanerOp(Operator):
 
         edge_loop_index = 0
         edge_ring_index = 0
-        point_pairs = []
 
         axes = ["x", "y", "z"]
         point_dims = [axis for axis in axes if axis != self.bl_mesh_up_axis]
@@ -2330,17 +2336,16 @@ class IntersectCurvesMeshCleanerOp(Operator):
                 vert_index_in_ring += 1
 
             edge_ring_index += 1
-            point_pairs.append(
-                ((current_extreme_1_vert.co.__getattribute__(point_dims[0]),
-                 current_extreme_1_vert.co.__getattribute__(point_dims[1])), 
-                (current_extreme_2_vert.co.__getattribute__(point_dims[0]),
-                 current_extreme_2_vert.co.__getattribute__(point_dims[1])))
-            )
+            out_point_pairs.append((current_extreme_1_vert, current_extreme_2_vert))
+            # point_pairs.append(
+            #     ((current_extreme_1_vert.co.__getattribute__(point_dims[0]),
+            #      current_extreme_1_vert.co.__getattribute__(point_dims[1])), 
+            #     (current_extreme_2_vert.co.__getattribute__(point_dims[0]),
+            #      current_extreme_2_vert.co.__getattribute__(point_dims[1])))
+            # )
             edge_loop_in_ring = edge_loop_in_ring.link_loop_radial_next.link_loop_next.link_loop_next
 
-        # TODO: mchen get line segments and find intersections among them using bezier intersection as limit
-
-        print(point_pairs)
+        print(out_point_pairs)
         return True
 
     def get_ordered_cross_section_points(self, points):
@@ -2363,6 +2368,32 @@ class IntersectCurvesMeshCleanerOp(Operator):
             ret.append(curr_point)
 
         return ret
+
+    def cross(self, v, w):
+        return v.x*w.y - v.y*w.x
+
+    def line_segment_intersects(self, p0, p1, q0, q1):
+        """
+        Find intersection between line segments p0-p1 and q0-q1
+        Reference: https://stackoverflow.com/a/565282
+        """
+        r = Point(p1.co.x - p0.co.x, p1.co.y - p0.co.y)
+        s = Point(q1.co.x - q0.co.x, q1.co.y - q0.co.y)
+
+        r_cross_s = self.cross(r, s)
+        diff = Point(q0.co.x - p0.co.x, q0.co.y - p0.co.y)
+        q_minus_p_cross_r = self.cross(diff, r)
+        q_minus_p_cross_s = self.cross(diff, s)
+
+        if isclose(r_cross_s, 0, abs_tol=self.absolute_float_tolerance):
+            return None # collinear or parallel and nonintersecting
+
+        u = q_minus_p_cross_r / r_cross_s
+        t = q_minus_p_cross_s / r_cross_s
+        if t < 0 or t > 1 or u < 0 or u > 1:
+            return None # not parallel but no intersection
+
+        return Point(p0.co.x + t * r.x, p1.co.y + t * r.y);
 
     def execute(self, context):
         params = bpy.context.window_manager.bezierToolkitParams
@@ -2407,6 +2438,7 @@ class IntersectCurvesMeshCleanerOp(Operator):
             self.report({'INFO'}, "No intersections found")
             return {'FINISHED'}
 
+        # examine the cross section mesh object and find its widest horizontal size
         mesh_points = selected_objects[-1].to_mesh()
         bm_points = bmesh.new()
         bm_points.from_mesh(mesh_points)
@@ -2424,20 +2456,68 @@ class IntersectCurvesMeshCleanerOp(Operator):
 
         cross_section_horizontal_size, min_point_index, max_point_index = self.get_cross_section_horizontal_size(points)
 
-        splines_to_inspect = {}
-        for (curve_index, spline, _), _ in intersectMap.items():
-            if curve_index not in splines_to_inspect:
-                splines_to_inspect[curve_index] = []
-            splines_to_inspect[curve_index].append(spline)
+        # Assuming each curve mesh object only has one spline, get the widest parts of the cross
+        # sections along it as pairs of points
+        curves_to_inspect = set()
+        intersecting_curves = {} # (curve1, curve2) => 2*number of intersections
+        for (curve_index, spline, _), intersections in intersectMap.items():
+            curves_to_inspect.add(curve_index)
+            for _, _, (other_curve_index, _, _) in intersections:
+                if (curve_index, other_curve_index) in intersecting_curves:
+                    intersecting_curves[(curve_index, other_curve_index)] += 1
+                    continue
+                if (other_curve_index, curve_index) in intersecting_curves:
+                    intersecting_curves[(other_curve_index, curve_index)] += 1
+                    continue
 
-        for curve_index, splines in splines_to_inspect.items():
+                intersecting_curves[(curve_index, other_curve_index)] = 1;
+
+        curves_as_pairs = {} # key = curve_index, value = (bmesh, list of cross section extreme pairs)
+
+        for curve_index in curves_to_inspect:
             blender_mesh = bmesh.new()
             blender_mesh.from_mesh(curve_mesh_pairs[curve_index].mesh)
             blender_mesh.faces.ensure_lookup_table()
-            if not self.traverse_mesh(blender_mesh, cross_section_point_count, cross_section_horizontal_size, min_point_index, max_point_index, points):
+
+            curves_as_pairs[curve_index] = (blender_mesh, [])
+            if not self.traverse_mesh(blender_mesh, cross_section_point_count, cross_section_horizontal_size, min_point_index, max_point_index, points, curves_as_pairs[curve_index][1]):
                 return {'FINISHED'}
 
-        print("Splines to inspect", splines_to_inspect)
+        # Now find intersections of the line segments of these extremes
+        for (curve1, curve2), twice_intersections in intersecting_curves.items():
+            num_intersections = twice_intersections / 2
+            num_intersections_of_extremes = num_intersections * 4
+            first_pairs_list = curves_as_pairs[curve1][1]
+            second_pairs_list = curves_as_pairs[curve2][1]
+            
+            # (order in pair of first curve, order in pair of second curve) => [(index of starting pair of intersection in first curve, index of starting pair of intersection in second curve)]
+            extremes_intersections = {(0, 0): [], (0, 1): [], (1, 0): [], (1, 1): []} 
+            for first_index in range(len(first_pairs_list) - 1):
+                for second_index in range(len(second_pairs_list) - 1):
+                    first_pair = first_pairs_list[first_index]
+                    first_next_pair = first_pairs_list[first_index + 1]
+                    second_pair = second_pairs_list[second_index]
+                    second_next_pair = second_pairs_list[second_index + 1]
+
+                    result_0_0 = self.line_segment_intersects(first_pair[0], first_next_pair[0], second_pair[0], second_next_pair[0])
+                    result_0_1 = self.line_segment_intersects(first_pair[0], first_next_pair[0], second_pair[1], second_next_pair[1])
+                    result_1_0 = self.line_segment_intersects(first_pair[1], first_next_pair[1], second_pair[0], second_next_pair[0])
+                    result_1_1 = self.line_segment_intersects(first_pair[1], first_next_pair[1], second_pair[1], second_next_pair[1])
+                    if result_0_0 is not None:
+                        extremes_intersections[(0, 0)].append((first_index, second_index, result_0_0))
+                    if result_0_1 is not None:
+                        extremes_intersections[(0, 1)].append((first_index, second_index, result_0_1))
+                    if result_1_0 is not None:
+                        extremes_intersections[(1, 0)].append((first_index, second_index, result_1_0))
+                    if result_1_1 is not None:
+                        extremes_intersections[(1, 1)].append((first_index, second_index, result_1_1))
+
+            found_intersection_count = sum([len(intersections) for intersections in extremes_intersections.values()])
+
+            if num_intersections_of_extremes != found_intersection_count:
+                self.report({'WARNING'}, "Did not find the expected number of intersections {intersections} between curve {c_index_1} and curve {c_index_2}. Found {actual_intersections}!".format(intersections=num_intersections_of_extremes, c_index_1=curve1, c_index_2=curve2, actual_intersections=found_intersection_count))
+                return {'FINISHED'}
+        import pdb; pdb.set_trace()
 
         return {'FINISHED'}
 
@@ -3264,6 +3344,8 @@ def getIntersectPts(seg0, seg1, soln, solnRounded, recurs, margin, rounding, \
 
 # splineInfos: [(curveIdx0, splineIdx0), (curveIdx0, splineIdx1),...]
 # First active means intersections only with the first curve (otherwise all combinations)
+# Return values:
+# intersectMap is a dictionary of { (curveId,splineId,segmentId) => [list of tuples of (Vector of intersect location, parametric value along segment it occurs at, and the (curveId,splineId,segmentId) of the curve it intersects with)]}
 def getSplineIntersectPts(curves, splineInfos, firstActive, margin, rounding):
     segPairMap = {}
     areas = [a for a in bpy.context.screen.areas if  a.type == 'VIEW_3D']
@@ -3297,15 +3379,18 @@ def getSplineIntersectPts(curves, splineInfos, firstActive, margin, rounding):
                 margin = margin, rounding = rounding)
             if(ret):
                 extKey = (idxCurve0, idxSpline0, idxSeg0)
-                intersectPoints, spline0ts, spline1ts = zip(*soln)
-                if(intersectMap.get(extKey) == None):
-                    intersectMap[extKey] = []
-                intersectMap[extKey] += zip(intersectPoints, spline0ts)
+                extKey2 = (idxCurve1, idxSpline1, idxSeg1)
 
-                extKey = (idxCurve1, idxSpline1, idxSeg1)
+                intersectPoints, spline0ts, spline1ts = zip(*soln)
+                otherCurveList = [extKey2] * len(intersectPoints)
                 if(intersectMap.get(extKey) == None):
                     intersectMap[extKey] = []
-                intersectMap[extKey] += zip(intersectPoints, spline1ts)
+                intersectMap[extKey] += zip(intersectPoints, spline0ts, otherCurveList)
+
+                otherCurveList2 = [extKey] * len(intersectPoints)
+                if(intersectMap.get(extKey2) == None):
+                    intersectMap[extKey2] = []
+                intersectMap[extKey2] += zip(intersectPoints, spline1ts, otherCurveList2)
 
                 allIntersectCos += intersectPoints
     return allIntersectCos, intersectMap
